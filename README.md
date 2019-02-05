@@ -2,7 +2,7 @@
 
 Digdag ssh_result> operator plugin to execute a remote command via ssh and storing output of shell to digdag store.
 
-This plugin is compatible with ssh plugin and ssh plugin and shresult plugin as long as it can.
+This plugin is compatible with ssh plugin and shresult plugin as long as it can.
 
 Ssh Configuration is same as ssh plugin.
 Storing Configuration is same as shresult plugin.
