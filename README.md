@@ -18,6 +18,12 @@ _export:
     stdout_log: true # Output stdout log (default true)
     stderr_log: true # Output stderr log (default false)
 
+  plugin:
+    repositories:
+      - https://jitpack.io
+    dependencies:
+      - com.github.yuhiwa:digdag-plugin-sshresult:0.0.1
+
 +step1:
   ssh_result>: hostname
   destination_variable: resultset
