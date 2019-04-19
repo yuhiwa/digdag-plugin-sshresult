@@ -20,6 +20,7 @@ import io.digdag.spi.SecretProvider;
 import io.digdag.spi.TaskResult;
 import io.digdag.spi.TemplateEngine;
 import io.digdag.util.BaseOperator;
+import io.digdag.util.RetryExecutor;
 import io.digdag.spi.PrivilegedVariables;
 import io.digdag.spi.TaskExecutionException;
 
@@ -33,6 +34,7 @@ import net.schmizz.sshj.userauth.UserAuthException;
 import net.schmizz.sshj.userauth.keyprovider.BaseFileKeyProvider;
 import net.schmizz.sshj.userauth.keyprovider.KeyProviderUtil;
 import net.schmizz.sshj.userauth.keyprovider.OpenSSHKeyFile;
+import org.apache.http.impl.execchain.RetryExec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +53,7 @@ import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static io.digdag.util.RetryExecutor.retryExecutor;
 
 public class SshResultOperatorFactory
         implements OperatorFactory
@@ -88,7 +91,10 @@ public class SshResultOperatorFactory
             super(context);
         }
 
-        private final int defaultCommandTimeout = 60;
+        private final static int defaultCommandTimeout = 60;
+        private final static int defaultInitialRetryWait = 500;
+        private final static int defaultMaxRetryWait = 2000;
+        private final static int defaultMaxRetryLimit = 3;
 
         @Override
         public TaskResult runTask()
@@ -100,6 +106,9 @@ public class SshResultOperatorFactory
             String host = params.get("host", String.class);
             int port = params.get("port", int.class, 22);
             int cmd_timeo = params.get("command_timeout", int.class, defaultCommandTimeout);
+            int initial_retry_wait = params.get("initial_retry_wait", int.class, defaultInitialRetryWait);
+            int max_retry_wait = params.get("max_retry_wait", int.class, defaultMaxRetryWait);
+            int max_retry_limit = params.get("max_retry_limit", int.class, defaultMaxRetryLimit);
 
             ProcessBuilder pb = new ProcessBuilder(command);
             pb.directory(workspace.getPath().toFile());
@@ -125,26 +134,31 @@ public class SshResultOperatorFactory
             // Set up process environment according to env config. This can also refer to secrets.
             collectEnvironmentVariables(env, context.getPrivilegedVariables());
 
-            final SSHClient ssh = new SSHClient();
+            SSHClient ssh = null;
 
             try {
                 try {
-                    setupHostKeyVerifier(ssh);
-
                     logger.info(String.format("Connecting %s:%d", host, port));
-                    for (int retryNum = 0; retryNum< RETRY_NUM; retryNum++) {
-                        try {
-//                            logger.info(retryNum + 1 + "times trying");
-                            ssh.connect(host, port);
-                            break;
-                        } catch (Exception e) {
+                    RetryExecutor retryExecutor = retryExecutor()
+                            .retryIf(exception -> true)
+                            .withInitialRetryWait(initial_retry_wait)
+                            .withMaxRetryWait(max_retry_wait)
+                            .onRetry((exception, retryCount, retryLimit, retryWait) -> logger.warn("Connection failed: retry {} of {} (wait {}ms)", retryCount, retryLimit, retryWait, exception))
+                            .withRetryLimit(max_retry_limit);
+                    try {
+                        ssh = retryExecutor.run(() -> {
                             try {
-                                TimeUnit.SECONDS.sleep(RETRY_INTERVAL);
-                            } catch (InterruptedException e1) {
-                                e1.printStackTrace();
+                                SSHClient sshTmp = new SSHClient();
+                                setupHostKeyVerifier(sshTmp);
+                                sshTmp.connect(host, port);
+                                return sshTmp;
+                            } catch (Exception e) {
+                                throw Throwables.propagate(e);
                             }
-                        } finally {
-                        }
+                        });
+                    }
+                    catch (RetryExecutor.RetryGiveupException ex) {
+                        throw Throwables.propagate(ex.getCause());
                     }
 
                     try {
