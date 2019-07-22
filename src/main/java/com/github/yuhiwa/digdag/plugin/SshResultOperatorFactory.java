@@ -7,9 +7,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.base.Throwables;
 
-import com.google.common.collect.ImmutableList;
-import com.google.inject.Inject;
-
 import io.digdag.client.config.Config;
 import io.digdag.client.config.ConfigException;
 import io.digdag.client.config.ConfigFactory;
@@ -22,36 +19,22 @@ import io.digdag.spi.TemplateEngine;
 import io.digdag.util.BaseOperator;
 import io.digdag.util.RetryExecutor;
 import io.digdag.spi.PrivilegedVariables;
-import io.digdag.spi.TaskExecutionException;
 
-import net.schmizz.sshj.SSHClient;
-import net.schmizz.sshj.common.IOUtils;
-import net.schmizz.sshj.connection.ConnectionException;
-import net.schmizz.sshj.connection.channel.direct.Session;
-import net.schmizz.sshj.transport.TransportException;
-import net.schmizz.sshj.transport.verification.PromiscuousVerifier;
-import net.schmizz.sshj.userauth.UserAuthException;
-import net.schmizz.sshj.userauth.keyprovider.BaseFileKeyProvider;
-import net.schmizz.sshj.userauth.keyprovider.KeyProviderUtil;
-import net.schmizz.sshj.userauth.keyprovider.OpenSSHKeyFile;
-import org.apache.http.impl.execchain.RetryExec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.util.concurrent.TimeUnit;
-import java.time.Duration;
-import java.io.BufferedWriter;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
+import com.jcraft.jsch.ChannelExec;
+import com.jcraft.jsch.JSch;
+import com.jcraft.jsch.JSchException;
+import com.jcraft.jsch.Session;
+
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import static io.digdag.util.RetryExecutor.retryExecutor;
 
@@ -91,21 +74,25 @@ public class SshResultOperatorFactory
             super(context);
         }
 
-        private final static int defaultCommandTimeout = 60;
+        private final int defaultCommandTimeout = 60;
         private final static int defaultInitialRetryWait = 500;
         private final static int defaultMaxRetryWait = 2000;
         private final static int defaultMaxRetryLimit = 3;
+        Session session;
+        ChannelExec channel;
+        Config storeParams;
 
         @Override
         public TaskResult runTask()
         {
             Config params = request.getConfig().mergeDefault(
-                    request.getConfig().getNestedOrGetEmpty("ssh"));
+                    request.getConfig().getNestedOrGetEmpty("ssh_result"));
 
             String command = params.get("_command", String.class);
             String host = params.get("host", String.class);
             int port = params.get("port", int.class, 22);
-            int cmd_timeo = params.get("command_timeout", int.class, defaultCommandTimeout);
+            int cmd_timeout = params.get("command_timeout", int.class, defaultCommandTimeout);
+            long cmd_timeout_msec = cmd_timeout * 1000;
             int initial_retry_wait = params.get("initial_retry_wait", int.class, defaultInitialRetryWait);
             int max_retry_wait = params.get("max_retry_wait", int.class, defaultMaxRetryWait);
             int max_retry_limit = params.get("max_retry_limit", int.class, defaultMaxRetryLimit);
@@ -134,113 +121,146 @@ public class SshResultOperatorFactory
             // Set up process environment according to env config. This can also refer to secrets.
             collectEnvironmentVariables(env, context.getPrivilegedVariables());
 
-            SSHClient ssh = null;
-
             try {
+                logger.info(String.format("Connecting %s:%d", host, port));
+
+                RetryExecutor retryExecutor = retryExecutor()
+                        .retryIf(exception -> true)
+                        .withInitialRetryWait(initial_retry_wait)
+                        .withMaxRetryWait(max_retry_wait)
+                        .onRetry( (exception, retryCount, retryLimit, retryWait) -> logger.warn(
+                                "Connection failed: retry {} of {} (wait {}ms)", retryCount, retryLimit, retryWait, exception))
+                        .withRetryLimit(max_retry_limit);
+
+
                 try {
-                    logger.info(String.format("Connecting %s:%d", host, port));
-                    RetryExecutor retryExecutor = retryExecutor()
-                            .retryIf(exception -> true)
-                            .withInitialRetryWait(initial_retry_wait)
-                            .withMaxRetryWait(max_retry_wait)
-                            .onRetry((exception, retryCount, retryLimit, retryWait) -> logger.warn("Connection failed: retry {} of {} (wait {}ms)", retryCount, retryLimit, retryWait, exception))
-                            .withRetryLimit(max_retry_limit);
-                    try {
-                        ssh = retryExecutor.run(() -> {
-                            try {
-                                SSHClient sshTmp = new SSHClient();
-                                setupHostKeyVerifier(sshTmp);
-                                sshTmp.connect(host, port);
-                                return sshTmp;
-                            } catch (Exception e) {
-                                throw Throwables.propagate(e);
-                            }
-                        });
-                    }
-                    catch (RetryExecutor.RetryGiveupException ex) {
-                        throw Throwables.propagate(ex.getCause());
-                    }
-
-                    try {
-
-                        authorize(ssh);
-                        final Session session = ssh.startSession();
-
-                        logger.info(String.format("Execute command: %s", command));
-                        final Session.Command result = session.exec(command);
-                        result.join(cmd_timeo, TimeUnit.SECONDS);
-
-                        int status = result.getExitStatus();
-
-                        // keep stdout
-                        String stdoutData = IOUtils.readFully(result.getInputStream()).toString();
-
-                        String varName = params.get("destination_variable", String.class);
-                        String stdoutFormat = params.get("stdout_format", String.class);
-
-                        ConfigFactory cf = request.getConfig().getFactory();
-                        Config storeParams = cf.create();
-
-                        storeParams.set(varName, createVariableObjectFromStdout(stdoutData, stdoutFormat));
-
-                        // dump stderr
-                        String stderrData = IOUtils.readFully(result.getErrorStream()).toString();
-
-                        boolean stdout_log = params.get("stdout_log",boolean.class,true);
-                        if( stdout_log ) {
-                            logger.info("STDOUT output");
-                            outputResultLog(stdoutData);
+                      retryExecutor.run(() -> {
+                        try {
+                            JSch sshTmp = new JSch();
+                            authorize(sshTmp);
+                            session.connect();
+                            return sshTmp;
                         }
-
-                        boolean stderr_log = params.get("stderr_log",boolean.class,false);
-                        if( stderr_log ){
-                            logger.info("STDERR output");
-                            outputResultLog(stderrData);
+                        catch (Exception e) {
+                            throw Throwables.propagate(e);
                         }
+                    });
+                }
+                catch (RetryExecutor.RetryGiveupException ex) {
+                    throw Throwables.propagate(ex.getCause());
+                }
 
-                        logger.info("Status: " + status);
-                        if (status != 0) {
-                            throw new RuntimeException(String.format("Command failed with code %d", status));
+                try {
+                    logger.info(String.format("Execute command: %s", command));
+                    channel = (ChannelExec) session.openChannel("exec");
+                    channel.setCommand(command);
+                    channel.setInputStream(null);
+                    StringBuilder outputBuffer = new StringBuilder();
+                    StringBuilder errorBuffer = new StringBuilder();
+                    InputStream stdout = channel.getInputStream();
+                    InputStream stderr = channel.getErrStream();
+                    channel.connect();
+
+                    byte[] tmp = new byte[1024];
+                    long start = System.currentTimeMillis();
+                    while (true) {
+                        while (stdout.available() > 0) {
+                            int i = stdout.read(tmp, 0, 1024);
+                            if (i < 0) { break; }
+                            outputBuffer.append(new String(tmp, 0, i));
                         }
-
-                        return TaskResult.defaultBuilder(request)
-                            .storeParams(storeParams)
-                            .build();
-
+                        while (stderr.available() > 0) {
+                            int i = stderr.read(tmp, 0, 1024);
+                            if (i < 0) { break; }
+                            errorBuffer.append(new String(tmp, 0, i));
+                        }
+                        if (channel.isClosed()) {
+                            if ((stdout.available() > 0) || (stderr.available() > 0)) { continue; }
+                            System.out.println("exit-status: " + channel.getExitStatus());
+                            break;
+                        }
+                        if ((System.currentTimeMillis() - start) > cmd_timeout_msec) {
+                            logger.error(String.format("Command timeout (exceeded %d seconds)", cmd_timeout));
+                            break;
+                        }
+                        try {
+                            Thread.sleep(1000);
+                        }
+                        catch (Exception ee) {
+                        }
                     }
-                    catch (ConnectionException ex) {
-                        throw Throwables.propagate(ex);
-                    }
-                    finally {
-                        ssh.close();
+
+                    // prepare keep stdout
+                    String stdoutData = outputBuffer.toString();
+                    String varName = params.get("destination_variable", String.class);
+                    String stdoutFormat = params.get("stdout_format", String.class);
+                    ConfigFactory cf = request.getConfig().getFactory();
+
+                    // dump stdout and stderr
+                    String stderrData = errorBuffer.toString();
+                    boolean stdout_log = params.get("stdout_log", boolean.class, true);
+                    if (stdout_log) {
+                        logger.info("STDOUT output");
+                        outputResultLog(stdoutData);
                     }
 
+                    boolean stderr_log = params.get("stderr_log", boolean.class, false);
+                    if (stderr_log) {
+                        logger.info("STDERR output");
+                        outputResultLog(stderrData);
+                    }
 
+                    // keep stdout
+                    storeParams = cf.create();
+                    storeParams.set(varName, createVariableObjectFromStdout(stdoutData, stdoutFormat));
+                }
+                catch (Exception e) {
+                    throw Throwables.propagate(e);
                 }
                 finally {
-                    ssh.disconnect();
+                    if (channel != null && channel.isConnected()) {
+                        // ssh.close();
+                        channel.disconnect();
+                    }
+                    int status = channel.getExitStatus();
+                    logger.info("Status: " + status);
+                    if (status != 0) {
+                        throw new RuntimeException(String.format("Command failed with code %d", status));
+                    }
+                    if (session != null && session.isConnected()) {
+                        session.disconnect();
+                    }
                 }
-            } catch ( IOException ex){
+            }
+            catch (Exception ex) {
                 throw Throwables.propagate(ex);
             }
+            return TaskResult.defaultBuilder(request)
+                    .storeParams(storeParams)
+                    .build();
         }
 
-        private void authorize(SSHClient ssh)
+        private void authorize(JSch ssh)
         {
-            Config params = request.getConfig().mergeDefault(
-                    request.getConfig().getNestedOrGetEmpty("ssh"));
+            Config params = request.getConfig().mergeDefault(request.getConfig().getNestedOrGetEmpty("ssh"));
 
             String user = params.get("user", String.class);
-            SecretProvider secrets = context.getSecrets().getSecrets("ssh");;
+            String host = params.get("host", String.class);
+            int port = params.get("port", int.class, 22);
+            SecretProvider secrets = context.getSecrets().getSecrets("ssh");
 
             try {
+
+                session = ssh.getSession(user, host, port);
+                setupHostKeyVerifier(session);
+
                 if (params.get("password_auth", Boolean.class, false)) {
                     Optional<String> password = getPassword(secrets, params);
                     if (!password.isPresent()) {
                         throw new RuntimeException("password not set");
                     }
                     logger.info(String.format("Authenticate user %s with password", user));
-                    ssh.authPassword(user, password.get());
+                    session.setPassword(password.get());
                 }
                 else {
                     Optional<String> publicKey = secrets.getSecretOptional("public_key");
@@ -250,22 +270,21 @@ public class SshResultOperatorFactory
                         throw new RuntimeException("public_key not set");
                     }
                     if (publicKeyPass.isPresent()) {
-                        // TODO
-                        // ssh.authPublickey(user,publicKey.get());
                         throw new ConfigException("public_key_passphrase doesn't support yet");
                     }
                     if (!privateKey.isPresent()) {
                         throw new ConfigException("private key not set");
                     }
 
-                    OpenSSHKeyFile keyfile = new OpenSSHKeyFile();
+                    logger.info(String.format("start add Identity"));
+                    String id_name = "public_auth";
+                    byte[] passphrase = null;
+                    ssh.addIdentity(id_name, privateKey.get().getBytes(), publicKey.get().getBytes(), passphrase);
 
-                    keyfile.init(privateKey.get(), publicKey.get());
                     logger.info(String.format("Authenticate user %s with public key", user));
-                    ssh.authPublickey(user, keyfile);
                 }
             }
-            catch (UserAuthException | TransportException ex) {
+            catch (JSchException ex) {
                 throw Throwables.propagate(ex);
             }
         }
@@ -281,9 +300,19 @@ public class SshResultOperatorFactory
             }
         }
 
-        private void setupHostKeyVerifier(SSHClient ssh)
+        private void setupHostKeyVerifier(Session session)
         {
-            ssh.addHostKeyVerifier(new PromiscuousVerifier());
+/*
+            try {
+                ssh.loadKnownHosts();
+*/
+            session.setConfig("StrictHostKeyChecking", "no");
+/*
+            }
+            catch (IOException ex) {
+                throw Throwables.propagate(ex);
+            }
+*/
         }
 
         private void outputResultLog(String log)
@@ -302,7 +331,6 @@ public class SshResultOperatorFactory
             env.put(name, variables.get(name));
           }
         }
-
 
         public Object createVariableObjectFromStdout(String stdoutData, String stdoutFormat) {
             // stdout is text
@@ -335,7 +363,7 @@ public class SshResultOperatorFactory
                     jsonObj = mapper
                         .readValue(stdoutData, new TypeReference<ArrayList<HashMap<String, Object>>>() {
                         });
-                } catch (IOException e) {
+                } catch (Exception e) {
                     throw Throwables.propagate(e);
                 }
                 return jsonObj;
