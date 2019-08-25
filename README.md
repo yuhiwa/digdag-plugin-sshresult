@@ -12,7 +12,7 @@ Storing Configuration is same as shresult plugin.
 ```
 
 _export:
-  ssh:
+  ssh_result:
     host: host.add.re.ss
     user: username
     stdout_log: true # Output stdout log (default true)
